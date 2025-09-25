@@ -989,6 +989,205 @@ func TestMigrationTask(t *testing.T) {
 	equalDbSeq(t, 3, expectedSequence, dbDrv)
 }
 
+func TestMigrationTaskError(t *testing.T) {
+	// This test simulates a migration task that fails, and ensures that:
+	// 1) The migration process stops and returns the task error.
+	// 2) The migration version is set to the migration task version
+	//    (version + TaskVersionOffset) and is not dirty.
+	// 3) Re-running Up will re-attempt the migration task.
+	// 4) Down will execute also re-execute a failed migration task
+	//    at a given version, before attempting the downgrade.
+	// 5) Once the migration task succeeds, the migration can finalize
+	//    and reach the latest version cleanly.
+	var (
+		cbError    = errors.New("migration task failure")
+		shouldFail = true
+	)
+
+	m, _ := New("stub://", "stub://",
+		// Create a task that will error when shouldFail is true.
+		WithMigrationTask(7, func(migr *Migration,
+			driver database.Driver) error {
+
+			// record that the task was executed
+			if shouldFail {
+				err := driver.Run(strings.NewReader(
+					"CALLBACK 7 FAILURE",
+				))
+				if err != nil {
+					return err
+				}
+
+				return cbError
+			}
+
+			err := driver.Run(strings.NewReader(
+				"CALLBACK 7 SUCCESS",
+			))
+			if err != nil {
+				return err
+			}
+
+			return nil
+		}),
+	)
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+	dbDrv := m.databaseDrv.(*dStub.Stub)
+
+	// Helper to check the migration version and dirty state.
+	checkVersion := func(expVer int) {
+		v, dirty, err := dbDrv.Version()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if v != expVer {
+			t.Fatalf("expected version %d, got v=%d", expVer, v)
+		}
+		if dirty {
+			t.Fatalf("expected clean version, but was dirty")
+		}
+	}
+
+	// 1) Run Up — the migration task for 7 should fail.
+	err := m.Up()
+	if !errors.Is(err, cbError) {
+		t.Fatal("expected cbError from failing migration task")
+	}
+
+	// The sequence should show the migrations up to 7, and then the
+	// failing callback.
+	expectedSequence := migrationSequence{
+		mr("CREATE 1"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CREATE 7"),
+		mr("CALLBACK 7 FAILURE"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 7 FAILURE")) {
+		t.Fatalf("expected database last migration to be callback 7, "+
+			"got %s", dbDrv.LastRunMigration)
+	}
+
+	// Version should be the migration task version and not dirty.
+	expectedTaskVer := int(7) + TaskVersionOffset
+	checkVersion(expectedTaskVer)
+
+	// 2) Re-run Up — since we are at the migration task version, it should
+	// try the task again and fail again.
+	err = m.Up()
+	if !errors.Is(err, cbError) {
+		t.Fatal("expected cbError from failing migration task")
+	}
+
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CREATE 7"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 FAILURE"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 7 FAILURE")) {
+		t.Fatalf("expected database last migration to be callback 7, "+
+			"got %s", dbDrv.LastRunMigration)
+	}
+
+	checkVersion(expectedTaskVer)
+
+	// 3) Attempt down — but since we are still at the migration task
+	// version, it should try the callback again and fail again and never
+	// downgrade.
+	err = m.Down()
+	if !errors.Is(err, cbError) {
+		t.Fatal("expected cbError from failing migration task")
+	}
+
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CREATE 7"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 FAILURE"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 7 FAILURE")) {
+		t.Fatalf("expected database last migration to be callback 7, "+
+			"got %s", dbDrv.LastRunMigration)
+	}
+
+	checkVersion(expectedTaskVer)
+
+	// 3) Make the callback succeed by setting shouldFail to false and run
+	// again. It should now successfully re-run the callback and then
+	// finalize the migration cleanly to the latest version (7).
+	shouldFail = false
+
+	err = m.Up()
+	if !errors.Is(err, ErrNoChange) {
+		t.Fatalf("unexpected error after migration task succeed: %v",
+			err)
+	}
+
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CREATE 7"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 SUCCESS"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	// And the last run migration should be from the callback.
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 7 SUCCESS")) {
+		t.Fatalf("expected last run migration to be from migration "+
+			"task, got %q", dbDrv.LastRunMigration)
+	}
+
+	// The version should now be the latest non migration task version 7
+	// and not dirty.
+	checkVersion(7)
+
+	// 4) Finally, try Up again — it should be a no-op since we are at the
+	// latest version, and shouldn't run the task again.
+	err = m.Up()
+	if !errors.Is(err, ErrNoChange) {
+		t.Fatalf("unexpected error after migration task succeed: %v",
+			err)
+	}
+
+	// Ensure the callback wasn't re-run.
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CREATE 7"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 FAILURE"),
+		mr("CALLBACK 7 SUCCESS"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	// And the last run migration should be from the previous callback.
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 7 SUCCESS")) {
+		t.Fatalf("expected last run migration to be from migration "+
+			"task, got %q", dbDrv.LastRunMigration)
+	}
+
+	checkVersion(7)
+}
+
 func TestUpDirty(t *testing.T) {
 	m, _ := New("stub://", "stub://")
 	dbDrv := m.databaseDrv.(*dStub.Stub)

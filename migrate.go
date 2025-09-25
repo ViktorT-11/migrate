@@ -232,13 +232,9 @@ func (m *Migrate) Migrate(version uint) error {
 		return err
 	}
 
-	curVersion, dirty, err := m.databaseDrv.Version()
+	curVersion, err := m.ensureCleanCurrentSQLVersion()
 	if err != nil {
 		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -258,13 +254,9 @@ func (m *Migrate) Steps(n int) error {
 		return err
 	}
 
-	curVersion, dirty, err := m.databaseDrv.Version()
+	curVersion, err := m.ensureCleanCurrentSQLVersion()
 	if err != nil {
 		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -285,13 +277,9 @@ func (m *Migrate) Up() error {
 		return err
 	}
 
-	curVersion, dirty, err := m.databaseDrv.Version()
+	curVersion, err := m.ensureCleanCurrentSQLVersion()
 	if err != nil {
 		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -307,13 +295,9 @@ func (m *Migrate) Down() error {
 		return err
 	}
 
-	curVersion, dirty, err := m.databaseDrv.Version()
+	curVersion, err := m.ensureCleanCurrentSQLVersion()
 	if err != nil {
 		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -345,13 +329,9 @@ func (m *Migrate) Run(migration ...*Migration) error {
 		return err
 	}
 
-	curVersion, dirty, err := m.databaseDrv.Version()
+	_, err := m.ensureCleanCurrentSQLVersion()
 	if err != nil {
 		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -540,6 +520,54 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 			from = int(prev)
 		}
 	}
+}
+
+// ensureCleanCurrentSQLVersion returns the database's current SQL migration
+// version in a clean (non-dirty) state. If the database is dirty, it returns
+// ErrDirty.
+//
+// If the current version when executing this function is a clean migrate task
+// version (meaning a migration task previously failed after the SQL migration
+// applied), this method re-executes the task for the associated SQL migration
+// version. If successful, the function normalizes the recorded version to the
+// SQL target version in a clean state so subsequent migrations can proceed.
+//
+// NOTE: The caller must hold the lock when calling this method.
+func (m *Migrate) ensureCleanCurrentSQLVersion() (int, error) {
+	curVersion, dirty, err := m.databaseDrv.Version()
+	if err != nil {
+		return curVersion, err
+	}
+
+	if dirty {
+		return curVersion, ErrDirty{curVersion}
+	}
+
+	// If the current version is a clean migration task version, then we
+	// need to rerun the task for the previous version before we can
+	// continue with any SQL migration(s). We can be certain here that the
+	// task was attempted to be run before, but errored. This is since
+	// the migration function only sets the version to a **clean** (i.e. not
+	// dirty) **task** version if the task errored on the last attempt.
+	if InTaskVersionRange(curVersion) {
+		sqlMigVersion := SQLMigrationVersion(curVersion)
+
+		err = m.execTaskAtMigVersion(sqlMigVersion)
+		if err != nil {
+			return curVersion, err
+		}
+
+		curVersion, dirty, err = m.databaseDrv.Version()
+		if err != nil {
+			return curVersion, err
+		}
+
+		if dirty {
+			return curVersion, ErrDirty{curVersion}
+		}
+	}
+
+	return curVersion, nil
 }
 
 // readUp reads up migrations from `from` limited by `limit`.
@@ -732,6 +760,30 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 	}
 }
 
+// readSingle reads a single migration for the given version, and sends it
+// over the passed channel.
+func (m *Migrate) readSingle(ver uint, ret chan<- interface{}) {
+	defer close(ret)
+
+	if err := m.versionExists(ver); err != nil {
+		ret <- err
+		return
+	}
+
+	migr, err := m.newMigration(ver, int(ver))
+	if err != nil {
+		ret <- err
+		return
+	}
+
+	ret <- migr
+	go func() {
+		if err := migr.Buffer(); err != nil {
+			m.logErr(err)
+		}
+	}()
+}
+
 // runMigrations reads *Migration and error from a channel. Any other type
 // sent on this channel will result in a panic. Each migration is then
 // proxied to the database driver and run against the database.
@@ -752,6 +804,12 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 		case *Migration:
 			migr := r
 
+			if migr.Version >= TaskVersionOffset {
+				return fmt.Errorf("migration version %v is "+
+					"invalid, must be < %v", migr.Version,
+					TaskVersionOffset)
+			}
+
 			// set version with dirty state
 			if err := m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
 				return err
@@ -763,23 +821,10 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 					return err
 				}
 
-				// If there is a task function for this
-				// migration, run it now.
-				cb, ok := m.opts.tasks[migr.Version]
-				if ok {
-					m.logVerbosePrintf("Running migration "+
-						"task for %v\n", migr.LogString())
-
-					err := cb(migr, m.databaseDrv)
-					if err != nil {
-						return fmt.Errorf("failed to "+
-							"execute migration "+
-							"task: %w",
-							err)
-					}
-
-					m.logVerbosePrintf("Migration task "+
-						"finished for %v\n", migr.LogString())
+				err := m.execTask(migr)
+				if err != nil {
+					return fmt.Errorf("migration task "+
+						"error: %w", err)
 				}
 			}
 
@@ -806,6 +851,117 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 		}
 	}
 	return nil
+}
+
+// execTask checks if a migration task exists for the passed migration and
+// proceeds to execute if one exists.
+func (m *Migrate) execTask(migr *Migration) error {
+	task, ok := m.opts.tasks[migr.Version]
+	if !ok {
+		m.logVerbosePrintf("No migration task set for %v\n",
+			migr.LogString())
+
+		return nil
+	}
+
+	m.logVerbosePrintf("Running migration task for %v\n", migr.LogString())
+
+	taskVersion := int(migr.Version) + TaskVersionOffset
+
+	// Persist that we are in the migration task phase for this version.
+	if err := m.databaseDrv.SetVersion(taskVersion, true); err != nil {
+		return err
+	}
+
+	err := task(migr, m.databaseDrv)
+	if err != nil {
+		// Mark the database version as the taskVersion but in a clean
+		// state, to indicate that the migration task errored. We will
+		// therefore re-run the task on the next migration run.
+		// The definition for the migration task version is that
+		// the database version is only ever set to a migration task
+		// version in a clean state if the task errored during its
+		// execution. We therefore mark the state as clean here, so that
+		// the migration task will be re-executed until it succeeds.
+		setErr := m.databaseDrv.SetVersion(taskVersion, false)
+		if setErr != nil {
+			// Note that if we error here, the database version will
+			// remain in a dirty state. As we cannot know if the
+			// migration task was executed or not in that scenario,
+			// manual intervention is required.
+			return fmt.Errorf("WARNING, failed to set migration "+
+				"version after migration task errored. Manual "+
+				"intervention needed! Migration task error: "+
+				"%w, version setting error : %w", err, setErr)
+		}
+
+		return fmt.Errorf("failed to execute migration task: %w", err)
+	}
+
+	m.logVerbosePrintf("Migration task finished for %v\n", migr.LogString())
+
+	return nil
+}
+
+// execTaskAtMigVersion executes only the migration task for the passed SQL
+// migration version.
+// The function can be used to re-execute the task for a SQL migration version
+// where the SQL migration was successfully applied, but where the task failed.
+func (m *Migrate) execTaskAtMigVersion(sqlMigVersion int) error {
+	var (
+		r      interface{}
+		migRet = make(chan interface{}, m.PrefetchMigrations)
+		err    error
+	)
+
+	// Fetch the migration for the specified SQL migration version.
+	go m.readSingle(uint(sqlMigVersion), migRet)
+
+	select {
+	case r = <-migRet:
+	case <-time.After(DefaultSingleMigReadTimeout):
+		return fmt.Errorf("timeout waiting for single migration "+
+			"version %v", sqlMigVersion)
+	}
+
+	if m.stop() {
+		return nil
+	}
+
+	switch r := r.(type) {
+	case *Migration:
+		// If the migration was found, execute the migration task.
+		migr := r
+
+		err = m.execTask(migr)
+		if err != nil {
+			return fmt.Errorf("execution of migration task for "+
+				"SQL migration version %d failed: %w",
+				sqlMigVersion, err)
+		}
+
+		m.logVerbosePrintf("successfully re-executed migration task "+
+			"for SQL migration version: %v\n", sqlMigVersion)
+
+		// After the migration task has been executed successfully, we
+		// set the db version to the SQL migration target version with a
+		// clean state, as we can now proceed with the next migrations,
+		// if any.
+		err = m.databaseDrv.SetVersion(migr.TargetVersion, false)
+		if err != nil {
+			return err
+		}
+
+		return nil
+
+	case error:
+		return fmt.Errorf("reading SQL migration at version "+
+			"%v failed: %w", sqlMigVersion, r)
+
+	default:
+		return fmt.Errorf("unknown type: %T when reading "+
+			"single migration", r)
+	}
 }
 
 // versionExists checks the source if either the up or down migration for
