@@ -59,3 +59,22 @@ func FilterCustomQuery(u *nurl.URL) *nurl.URL {
 	ux.RawQuery = vx.Encode()
 	return &ux
 }
+
+// IsPostStepCallbackVersion returns true if the passed version is a post-step
+// callback version.
+func IsPostStepCallbackVersion(version int) bool {
+	return version >= PostStepCallbackOffset
+}
+
+// SQLMigrationVersion returns the corresponding SQL migration version for the
+// given version. If the version passed is a post-step callback version, the
+// function will return the version for the corresponding SQL migration.
+// If the version passed already is a SQL migration version, the function will
+// return the passed version as is.
+func SQLMigrationVersion(version int) int {
+	if IsPostStepCallbackVersion(version) {
+		return version - PostStepCallbackOffset
+	}
+
+	return version
+}

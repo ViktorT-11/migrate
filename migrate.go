@@ -36,6 +36,31 @@ var (
 	ErrLockTimeout    = errors.New("timeout: can't acquire database lock")
 )
 
+// PostStepCallbackOffset is a sentinel offset added to a normal SQL migration
+// version. During the post-step callback for version V, the database version is
+// persisted as (V + PostStepCallbackOffset). This enables the migrate package
+// to detect and re-run a post-step callback which errored after the
+// corresponding SQL migration was applied successfully.
+// Note that only the post-step callback is re-run, the SQL migration is not
+// re-applied.
+//
+// If the persisted version is >= PostStepCallbackOffset and not `dirty`, then
+// the post-step callback for (version - PostStepCallbackOffset) will be re-run
+// on the next migration run.
+// If the persisted version is `dirty`, manual intervention is required, as it's
+// not possible by the migration framework to determine whether post-step
+// callback actually was executed successfully or not during the last execution
+// attempt.
+//
+// NOTE:
+// Changing this value is a breaking change for any database that currently
+// has a post-step phase recorded. Do not change it unless you also provide
+// a safe transition strategy.
+// Also note that no SQL migration can use a version >= PostStepCallbackOffset.
+// Such versions are reserved for the post-step callback phase, and any SQL
+// migrations with such versions will cause an error.
+const PostStepCallbackOffset = 1000000000
+
 // ErrShortLimit is an error returned when not enough migrations
 // can be returned by a source for a given limit.
 type ErrShortLimit struct {
@@ -296,6 +321,23 @@ func (m *Migrate) Migrate(version uint) error {
 		return m.unlockErr(ErrDirty{curVersion})
 	}
 
+	// If the current version is a clean post-step callback version, then
+	// we need to rerun the post-step callback for the previous version
+	// before we can continue with any SQL migration(s).
+	if IsPostStepCallbackVersion(curVersion) {
+		sqlMigVersion := SQLMigrationVersion(curVersion)
+
+		err := m.executePostStepCallbackForSQLMig(sqlMigVersion)
+		if err != nil {
+			return m.unlockErr(err)
+		}
+
+		curVersion, dirty, err = m.databaseDrv.Version()
+		if err != nil {
+			return m.unlockErr(err)
+		}
+	}
+
 	ret := make(chan interface{}, m.PrefetchMigrations)
 	go m.read(curVersion, int(version), ret)
 
@@ -320,6 +362,23 @@ func (m *Migrate) Steps(n int) error {
 
 	if dirty {
 		return m.unlockErr(ErrDirty{curVersion})
+	}
+
+	// If the current version is a clean post-step callback version, then
+	// we need to rerun the post-step callback for the previous version
+	// before we can continue with any SQL migration(s).
+	if IsPostStepCallbackVersion(curVersion) {
+		sqlMigVersion := SQLMigrationVersion(curVersion)
+
+		err := m.executePostStepCallbackForSQLMig(sqlMigVersion)
+		if err != nil {
+			return m.unlockErr(err)
+		}
+
+		curVersion, dirty, err = m.databaseDrv.Version()
+		if err != nil {
+			return m.unlockErr(err)
+		}
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -349,6 +408,23 @@ func (m *Migrate) Up() error {
 		return m.unlockErr(ErrDirty{curVersion})
 	}
 
+	// If the current version is a clean post-step callback version, then
+	// we need to rerun the post-step callback for the previous version
+	// before we can continue with any SQL migration(s).
+	if IsPostStepCallbackVersion(curVersion) {
+		sqlMigVersion := SQLMigrationVersion(curVersion)
+
+		err := m.executePostStepCallbackForSQLMig(sqlMigVersion)
+		if err != nil {
+			return m.unlockErr(err)
+		}
+
+		curVersion, dirty, err = m.databaseDrv.Version()
+		if err != nil {
+			return m.unlockErr(err)
+		}
+	}
+
 	ret := make(chan interface{}, m.PrefetchMigrations)
 
 	go m.readUp(curVersion, -1, ret)
@@ -369,6 +445,23 @@ func (m *Migrate) Down() error {
 
 	if dirty {
 		return m.unlockErr(ErrDirty{curVersion})
+	}
+
+	// If the current version is a clean post-step callback version, then
+	// we need to rerun the post-step callback for the previous version
+	// before we can continue with any SQL migration(s).
+	if IsPostStepCallbackVersion(curVersion) {
+		sqlMigVersion := SQLMigrationVersion(curVersion)
+
+		err := m.executePostStepCallbackForSQLMig(sqlMigVersion)
+		if err != nil {
+			return m.unlockErr(err)
+		}
+
+		curVersion, dirty, err = m.databaseDrv.Version()
+		if err != nil {
+			return m.unlockErr(err)
+		}
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -407,6 +500,23 @@ func (m *Migrate) Run(migration ...*Migration) error {
 
 	if dirty {
 		return m.unlockErr(ErrDirty{curVersion})
+	}
+
+	// If the current version is a clean post step callback version, then
+	// we need to rerun the post step callback for the previous version
+	// before we can continue with any SQL migration(s).
+	if IsPostStepCallbackVersion(curVersion) {
+		sqlMigVersion := SQLMigrationVersion(curVersion)
+
+		err := m.executePostStepCallbackForSQLMig(sqlMigVersion)
+		if err != nil {
+			return m.unlockErr(err)
+		}
+
+		curVersion, dirty, err = m.databaseDrv.Version()
+		if err != nil {
+			return m.unlockErr(err)
+		}
 	}
 
 	ret := make(chan interface{}, m.PrefetchMigrations)
@@ -787,6 +897,30 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 	}
 }
 
+// readSingle reads a single migration for the given version, and sends it
+// over the passed channel.
+func (m *Migrate) readSingle(ver uint, ret chan<- interface{}) {
+	defer close(ret)
+
+	if err := m.versionExists(ver); err != nil {
+		ret <- err
+		return
+	}
+
+	migr, err := m.newMigration(ver, int(ver))
+	if err != nil {
+		ret <- err
+		return
+	}
+
+	ret <- migr
+	go func() {
+		if err := migr.Buffer(); err != nil {
+			m.logErr(err)
+		}
+	}()
+}
+
 // runMigrations reads *Migration and error from a channel. Any other type
 // sent on this channel will result in a panic. Each migration is then
 // proxied to the database driver and run against the database.
@@ -807,6 +941,12 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 		case *Migration:
 			migr := r
 
+			if migr.Version >= PostStepCallbackOffset {
+				return fmt.Errorf("migration version %v is "+
+					"invalid, must be < %v", migr.Version,
+					PostStepCallbackOffset)
+			}
+
 			// set version with dirty state
 			if err := m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
 				return err
@@ -818,23 +958,9 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 					return err
 				}
 
-				// If there is a post execution function for
-				// this migration, run it now.
-				cb, ok := m.opts.postStepCallbacks[migr.Version]
-				if ok {
-					m.logVerbosePrintf("Running post step "+
-						"callback for %v\n", migr.LogString())
-
-					err := cb(migr, m.databaseDrv)
-					if err != nil {
-						return fmt.Errorf("failed to "+
-							"execute post "+
-							"step callback: %w",
-							err)
-					}
-
-					m.logVerbosePrintf("Post step callback "+
-						"finished for %v\n", migr.LogString())
+				err := m.executePostStepCallback(migr)
+				if err != nil {
+					return err
 				}
 			}
 
@@ -861,6 +987,109 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 		}
 	}
 	return nil
+}
+
+// executePostStepCallback checks if a post-step callback exists for the passed
+// migration and proceeds to execute if one exists.
+func (m *Migrate) executePostStepCallback(migr *Migration) error {
+	cb, ok := m.opts.postStepCallbacks[migr.Version]
+	if ok {
+		m.logVerbosePrintf("Running post step callback for %v\n",
+			migr.LogString())
+
+		postStepVersion := int(migr.Version) + PostStepCallbackOffset
+
+		// Persist that we are in the post-step phase for this version.
+		if err := m.databaseDrv.SetVersion(postStepVersion, true); err != nil {
+			return err
+		}
+
+		err := cb(migr, m.databaseDrv)
+		if err != nil {
+			//  Mark the database version as the postStepVersion but
+			// in a clean state, to indicate that the post-step
+			// callback errored. We will therefore re-run the
+			// post-step callback on the next migration run.
+			if setErr := m.databaseDrv.SetVersion(postStepVersion, false); setErr != nil {
+				// Note that if we error here, the database
+				// version will remain in a dirty state. As we
+				// cannot know if the post-step callback was
+				// executed or not in that scenario, manual
+				// intervention is required.
+				return fmt.Errorf("WARNING, failed to set "+
+					"migration version after post "+
+					"migration step errored. Manual "+
+					"intervention needed! Post migration "+
+					"error: %w, version setting error : %w",
+					err, setErr)
+			}
+
+			return fmt.Errorf("failed to execute post step "+
+				"callback: %w", err)
+		}
+
+		m.logVerbosePrintf("Post step callback finished for %v\n",
+			migr.LogString())
+	}
+
+	return nil
+}
+
+// executePostStepCallbackForSQLMig executes only the post-step callback for the
+// passed SQL migration version.
+// The function can be used to re-execute the post-step callback for a SQL
+// migration version where the SQL migration was successfully applied, but where
+// the post-step callback failed.
+func (m *Migrate) executePostStepCallbackForSQLMig(sqlMigVersion int) error {
+	var (
+		r      interface{}
+		migRet = make(chan interface{}, m.PrefetchMigrations)
+		err    error
+	)
+
+	// Fetch the migration for the specified SQL migration version.
+	go m.readSingle(uint(sqlMigVersion), migRet)
+
+	select {
+	case r = <-migRet:
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for single migration "+
+			"version %v", sqlMigVersion)
+	}
+
+	if m.stop() {
+		return nil
+	}
+
+	switch r := r.(type) {
+	case *Migration:
+		// If the migration was found, execute the post step callback.
+		migr := r
+
+		err = m.executePostStepCallback(migr)
+		if err != nil {
+			return err
+		}
+
+		m.logVerbosePrintf("successfully re-executed post step "+
+			"callback for SQL migration version: %v\n",
+			sqlMigVersion)
+
+		// set clean state
+		if err = m.databaseDrv.SetVersion(migr.TargetVersion, false); err != nil {
+			return err
+		}
+
+		return nil
+
+	case error:
+		return fmt.Errorf("reading SQL migration at version "+
+			"%v failed: %w", sqlMigVersion, r)
+
+	default:
+		return fmt.Errorf("unknown type: %T when reading "+
+			"single migration", r)
+	}
 }
 
 // versionExists checks the source if either the up or down migration for
