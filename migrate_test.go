@@ -879,9 +879,9 @@ func TestUpAndDown(t *testing.T) {
 	equalDbSeq(t, 1, expectedSequence, dbDrv)
 }
 
-func TestPostStepCallback(t *testing.T) {
-	m, _ := New("stub://", "stub://", WithPostStepCallbacks(
-		map[uint]PostStepCallback{
+func TestMigrationTask(t *testing.T) {
+	m, _ := New("stub://", "stub://", WithMigrationTasks(
+		map[uint]MigrationTask{
 			1: func(m *Migration, driver database.Driver) error {
 				return driver.Run(
 					strings.NewReader("CALLBACK 1"),
