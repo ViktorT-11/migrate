@@ -23,6 +23,15 @@ import (
 //	| u d |  -  | u   | u d |   d |  -  | u d |
 var sourceStubMigrations *source.Migrations
 
+// sourceMigrationTaskMigrations hold the following migrations:
+// u = up migration, d = down migration, n = version, SQL = SQL migration,
+// TSK = migration task
+//
+//	|  1  |  2  |  3  |  4  |  5  |  -  |  7  |
+//	| SQL | TSK | SQL | SQL | SQL |  -  | TSK |
+//	| u d | u d | u   | u d |   d |  -  | u   |
+var sourceMigrationTaskMigrations *source.Migrations
+
 const (
 	srcDrvNameStub = "stub"
 	dbDrvNameStub  = "stub"
@@ -38,6 +47,17 @@ func init() {
 	sourceStubMigrations.Append(&source.Migration{Version: 5, Direction: source.Down, Identifier: "DROP 5"})
 	sourceStubMigrations.Append(&source.Migration{Version: 7, Direction: source.Up, Identifier: "CREATE 7"})
 	sourceStubMigrations.Append(&source.Migration{Version: 7, Direction: source.Down, Identifier: "DROP 7"})
+
+	sourceMigrationTaskMigrations = source.NewMigrations()
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 1, Direction: source.Up, Identifier: "CREATE 1"})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 1, Direction: source.Down, Identifier: "DROP 1"})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 2, Direction: source.Up, Identifier: ""})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 2, Direction: source.Down, Identifier: ""})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 3, Direction: source.Up, Identifier: "CREATE 3"})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 4, Direction: source.Up, Identifier: "CREATE 4"})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 4, Direction: source.Down, Identifier: "DROP 4"})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 5, Direction: source.Down, Identifier: "DROP 5"})
+	sourceMigrationTaskMigrations.Append(&source.Migration{Version: 7, Direction: source.Up, Identifier: ""})
 }
 
 type DummyInstance struct{ Name string }
@@ -882,9 +902,9 @@ func TestUpAndDown(t *testing.T) {
 func TestMigrationTask(t *testing.T) {
 	m, _ := New("stub://", "stub://", WithMigrationTasks(
 		map[uint]MigrationTask{
-			1: func(m *Migration, driver database.Driver) error {
+			2: func(m *Migration, driver database.Driver) error {
 				return driver.Run(
-					strings.NewReader("CALLBACK 1"),
+					strings.NewReader("CALLBACK 2"),
 				)
 			},
 			7: func(m *Migration, driver database.Driver) error {
@@ -894,7 +914,7 @@ func TestMigrationTask(t *testing.T) {
 			},
 		},
 	))
-	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceMigrationTaskMigrations
 	dbDrv := m.databaseDrv.(*dStub.Stub)
 
 	// go Up first
@@ -903,10 +923,9 @@ func TestMigrationTask(t *testing.T) {
 	}
 	expectedSequence := migrationSequence{
 		mr("CREATE 1"),
-		mr("CALLBACK 1"),
+		mr("CALLBACK 2"),
 		mr("CREATE 3"),
 		mr("CREATE 4"),
-		mr("CREATE 7"),
 		mr("CALLBACK 7"),
 	}
 	equalDbSeq(t, 0, expectedSequence, dbDrv)
@@ -920,24 +939,25 @@ func TestMigrationTask(t *testing.T) {
 	if err := m.Down(); err != nil {
 		t.Fatal(err)
 	}
+
+	// Note that "CALLBACK 7" isn't repeated when going down, as that
+	// migration source only contains an .up migration for version 7, and
+	// not at .down migration.
 	expectedSequence = migrationSequence{
 		mr("CREATE 1"),
-		mr("CALLBACK 1"),
+		mr("CALLBACK 2"),
 		mr("CREATE 3"),
 		mr("CREATE 4"),
-		mr("CREATE 7"),
-		mr("CALLBACK 7"),
-		mr("DROP 7"),
 		mr("CALLBACK 7"),
 		mr("DROP 5"),
 		mr("DROP 4"),
+		mr("CALLBACK 2"),
 		mr("DROP 1"),
-		mr("CALLBACK 1"),
 	}
 	equalDbSeq(t, 1, expectedSequence, dbDrv)
 
-	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 1")) {
-		t.Fatalf("expected database last migration to be callback 1, "+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("DROP 1")) {
+		t.Fatalf("expected database last migration to be DROP 1, "+
 			"got %s", dbDrv.LastRunMigration)
 	}
 
@@ -947,19 +967,15 @@ func TestMigrationTask(t *testing.T) {
 	}
 	expectedSequence = migrationSequence{
 		mr("CREATE 1"),
-		mr("CALLBACK 1"),
+		mr("CALLBACK 2"),
 		mr("CREATE 3"),
 		mr("CREATE 4"),
-		mr("CREATE 7"),
-		mr("CALLBACK 7"),
-		mr("DROP 7"),
 		mr("CALLBACK 7"),
 		mr("DROP 5"),
 		mr("DROP 4"),
+		mr("CALLBACK 2"),
 		mr("DROP 1"),
-		mr("CALLBACK 1"),
 		mr("CREATE 1"),
-		mr("CALLBACK 1"),
 	}
 	equalDbSeq(t, 2, expectedSequence, dbDrv)
 
@@ -968,25 +984,302 @@ func TestMigrationTask(t *testing.T) {
 	}
 	expectedSequence = migrationSequence{
 		mr("CREATE 1"),
-		mr("CALLBACK 1"),
+		mr("CALLBACK 2"),
 		mr("CREATE 3"),
 		mr("CREATE 4"),
-		mr("CREATE 7"),
-		mr("CALLBACK 7"),
-		mr("DROP 7"),
 		mr("CALLBACK 7"),
 		mr("DROP 5"),
 		mr("DROP 4"),
+		mr("CALLBACK 2"),
 		mr("DROP 1"),
-		mr("CALLBACK 1"),
 		mr("CREATE 1"),
-		mr("CALLBACK 1"),
+		mr("CALLBACK 2"),
 		mr("CREATE 3"),
 		mr("CREATE 4"),
-		mr("CREATE 7"),
 		mr("CALLBACK 7"),
 	}
 	equalDbSeq(t, 3, expectedSequence, dbDrv)
+}
+
+func TestMigrationTaskError(t *testing.T) {
+	// This test simulates a migration task that fails, and ensures that:
+	// 1) The migration process stops and returns the task error.
+	// 2) The migration version is set to the migration version set prior
+	//    to executing the migration task if the task errors.
+	// 3) Re-running Up will re-attempt the migration task.
+	// 4) Down will not re-execute a migration task if it errored, as the
+	//    version should have been set to the version prior to executing the
+	//    migration task.
+	// 5) Once the migration task succeeds, the migration can finalize
+	//    and reach the latest version cleanly.
+	// 6) Down will only execute the migration task at a given version if a
+	//    ".down" file is defined for the migration task.
+	var (
+		cbError    = errors.New("migration task failure")
+		shouldFail = true
+	)
+
+	// The migration task for version 2 will error if shouldFail == false,
+	// and succeed if it is set to true.
+	m, _ := New("stub://", "stub://", WithMigrationTasks(
+		map[uint]MigrationTask{
+			2: func(migr *Migration, driver database.Driver) error {
+				// record that the task was executed
+				if shouldFail {
+					err := driver.Run(strings.NewReader(
+						"CALLBACK 2 FAILURE",
+					))
+					if err != nil {
+						return err
+					}
+
+					return cbError
+				}
+
+				err := driver.Run(strings.NewReader(
+					"CALLBACK 2 SUCCESS",
+				))
+				if err != nil {
+					return err
+				}
+
+				return nil
+			},
+			7: func(m *Migration, driver database.Driver) error {
+				return driver.Run(
+					strings.NewReader("CALLBACK 7"),
+				)
+			},
+		},
+	))
+
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceMigrationTaskMigrations
+	dbDrv := m.databaseDrv.(*dStub.Stub)
+
+	// Helper to check the migration version and dirty state.
+	checkVersion := func(expVer int) {
+		v, dirty, err := dbDrv.Version()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if v != expVer {
+			t.Fatalf("expected version %d, got v=%d", expVer, v)
+		}
+		if dirty {
+			t.Fatalf("expected clean version, but was dirty")
+		}
+	}
+
+	// 1) Run Up — the migration task for 2 should fail.
+	err := m.Up()
+	if !errors.Is(err, cbError) {
+		t.Fatal("expected cbError from failing migration task")
+	}
+
+	// The sequence should show the migrations prior to version 2, and then
+	// the failing callback for version 2.
+	expectedSequence := migrationSequence{
+		mr("CREATE 1"),
+		mr("CALLBACK 2 FAILURE"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 2 FAILURE")) {
+		t.Fatalf("expected database last migration to be callback 2, "+
+			"got %s", dbDrv.LastRunMigration)
+	}
+
+	// 2) Due to the that the migration task errored, the version should
+	// have been reset to the version set before the migration task was
+	// executed.
+	checkVersion(1)
+
+	// 3) Re-run Up — since the database version is set to version 1, it
+	// should try the migration task again at version 2 and fail again.
+	err = m.Up()
+	if !errors.Is(err, cbError) {
+		t.Fatal("expected cbError from failing migration task")
+	}
+
+	// The migration task for version 2 should now have failed twice.
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("CALLBACK 2 FAILURE"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 2 FAILURE")) {
+		t.Fatalf("expected database last migration to be callback 2, "+
+			"got %s", dbDrv.LastRunMigration)
+	}
+
+	// The version should have been reset to 1 once again.
+	checkVersion(1)
+
+	// 4) Execute down — as the version should have been reset to 1, this
+	// should not re-execute the migration task for version 2.
+	err = m.Down()
+
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("DROP 1"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("DROP 1")) {
+		t.Fatalf("expected database last migration to be DROP 1, "+
+			"got %s", dbDrv.LastRunMigration)
+	}
+
+	// The version should now be at -1, as the migration for version 1 has
+	// been dropped.
+	checkVersion(-1)
+
+	// 5) Make the callback succeed by setting shouldFail to false and run
+	// again. It should now successfully re-run the callback and then
+	// finalize the migration cleanly to the latest version (7).
+	shouldFail = false
+
+	err = m.Up()
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("DROP 1"),
+		mr("CREATE 1"),
+		mr("CALLBACK 2 SUCCESS"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CALLBACK 7"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	// And the last run migration should be from the callback.
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 7")) {
+		t.Fatalf("expected last run migration to be from migration "+
+			"task, got %q", dbDrv.LastRunMigration)
+	}
+
+	// The version should now be the latest non migration task version 2
+	// and not dirty.
+	checkVersion(7)
+
+	// Try Up again — it should be a no-op since we are at the latest
+	// version, and shouldn't run the task again.
+	err = m.Up()
+	if !errors.Is(err, ErrNoChange) {
+		t.Fatalf("unexpected error after migration task succeed: %v",
+			err)
+	}
+
+	// Ensure the callback wasn't re-run.
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("DROP 1"),
+		mr("CREATE 1"),
+		mr("CALLBACK 2 SUCCESS"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CALLBACK 7"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	// And the last run migration should be from the previous callback.
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("CALLBACK 7")) {
+		t.Fatalf("expected last run migration to be from migration "+
+			"task, got %q", dbDrv.LastRunMigration)
+	}
+
+	checkVersion(7)
+
+	// 6) Finally, running Down now should only execute the migration task
+	//    at for version 2, as that migration task is the only tash which
+	//    ".down" file is defined for the migration task.
+	err = m.Down()
+
+	expectedSequence = migrationSequence{
+		mr("CREATE 1"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("CALLBACK 2 FAILURE"),
+		mr("DROP 1"),
+		mr("CREATE 1"),
+		mr("CALLBACK 2 SUCCESS"),
+		mr("CREATE 3"),
+		mr("CREATE 4"),
+		mr("CALLBACK 7"),
+		mr("DROP 5"),
+		mr("DROP 4"),
+		mr("CALLBACK 2 SUCCESS"),
+		mr("DROP 1"),
+	}
+	equalDbSeq(t, 0, expectedSequence, dbDrv)
+
+	if !bytes.Equal(dbDrv.LastRunMigration, []byte("DROP 1")) {
+		t.Fatalf("expected database last migration to be DROP 1, "+
+			"got %s", dbDrv.LastRunMigration)
+	}
+
+	// The version should now be at -1, as the migration for version 1 has
+	// been dropped.
+	checkVersion(-1)
+}
+
+func TestMigrationTypeCombos(t *testing.T) {
+	// This test ensures that a migration cannot be both an SQL migration
+	// and a Migration task at the same time. It also tests that a migration
+	// can be neither an SQL migration nor a Migration Task.
+
+	// Test that a migration can't be both an SQL migration and a Migration
+	// task at the same time.
+	m1, _ := New("stub://", "stub://", WithMigrationTasks(
+		map[uint]MigrationTask{
+			1: func(m *Migration, driver database.Driver) error {
+				return driver.Run(
+					strings.NewReader("CALLBACK 1"),
+				)
+			},
+		},
+	))
+
+	bothTypeMig := source.NewMigrations()
+	bothTypeMig.Append(
+		&source.Migration{Version: 1, Direction: source.Up,
+			Identifier: "CREATE 1"},
+	)
+
+	m1.sourceDrv.(*sStub.Stub).Migrations = bothTypeMig
+
+	err := m1.Up()
+	if err == nil || !strings.Contains(err.Error(),
+		"migration has both a SQL migration and a migration task set") {
+
+		t.Fatal("expected an error indicating that a migration can't" +
+			"be both an SQL migration and a migration task")
+	}
+
+	// Test that a migration can be neither an SQL migration nor a Migration
+	// task.
+	m2, _ := New("stub://", "stub://")
+
+	noTypeMig := source.NewMigrations()
+	noTypeMig.Append(
+		&source.Migration{Version: 1, Direction: source.Up,
+			Identifier: ""},
+	)
+
+	m2.sourceDrv.(*sStub.Stub).Migrations = noTypeMig
+
+	err = m2.Up()
+	if err != nil {
+		t.Fatal("expected an error no error when a migration was " +
+			"neither an SQL migration nor a migration task")
+	}
 }
 
 func TestUpDirty(t *testing.T) {

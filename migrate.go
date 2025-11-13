@@ -5,9 +5,13 @@
 package migrate
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -732,6 +736,34 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 	}
 }
 
+// hasSQLMigration checks if the passed data contains executable statements,
+// meaning that the data doesn't only contain comments/whitespace or semicolons.
+func (m *Migrate) hasSQLMigration(data []byte) (bool, error) {
+	s := string(data)
+
+	// Remove Byte Order Mark (BOM) if present in the migration file.
+	s = strings.TrimPrefix(s, "\uFEFF")
+
+	// Strip block comments /* ... */ (non-greedy, across lines).
+	reBlock := regexp.MustCompile(`(?s)/\*.*?\*/`)
+	s = reBlock.ReplaceAllString(s, "")
+
+	// Strip line comments -- ... (to end of line).
+	reLine := regexp.MustCompile(`(?m)--[^\n\r]*`)
+	s = reLine.ReplaceAllString(s, "")
+
+	// Trim whitespaces.
+	s = strings.TrimSpace(s)
+
+	// Remove any semicolons, newlines, tabs, or spaces from the beginning
+	// and end of the string.
+	s = strings.Trim(s, ";\r\n\t ")
+
+	// If the string still contains any characters, the data likely
+	// contains executable statements.
+	return len(s) > 0, nil
+}
+
 // runMigrations reads *Migration and error from a channel. Any other type
 // sent on this channel will result in a panic. Each migration is then
 // proxied to the database driver and run against the database.
@@ -752,34 +784,58 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 		case *Migration:
 			migr := r
 
-			// set version with dirty state
-			if err := m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
-				return err
-			}
-
 			if migr.Body != nil {
-				m.logVerbosePrintf("Read and execute %v\n", migr.LogString())
-				if err := m.databaseDrv.Run(migr.BufferedBody); err != nil {
+				// Read the body so we can inspect and (re)use it.
+				data, err := io.ReadAll(migr.BufferedBody)
+				if err != nil {
+					return fmt.Errorf("read migration body: %w", err)
+				}
+
+				// Reset the reader so the driver can read it
+				migr.BufferedBody = bytes.NewReader(data)
+
+				// Check if the migration contains an SQL
+				// migration.
+				hasSqlMig, err := m.hasSQLMigration(data)
+				if err != nil {
 					return err
 				}
 
-				// If there is a task function for this
-				// migration, run it now.
-				cb, ok := m.opts.tasks[migr.Version]
-				if ok {
-					m.logVerbosePrintf("Running migration "+
-						"task for %v\n", migr.LogString())
+				// Check if the migration contains a migration
+				// task.
+				_, hasMigTask := m.opts.tasks[migr.Version]
 
-					err := cb(migr, m.databaseDrv)
-					if err != nil {
-						return fmt.Errorf("failed to "+
-							"execute migration "+
-							"task: %w",
-							err)
+				// Execute the SQL migration or the migration
+				// task.
+				switch {
+				case hasSqlMig && hasMigTask:
+					return fmt.Errorf("migration has both " +
+						"a SQL migration and a " +
+						"migration task set")
+
+				case hasSqlMig:
+					if err = m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
+						return err
 					}
 
-					m.logVerbosePrintf("Migration task "+
-						"finished for %v\n", migr.LogString())
+					m.logVerbosePrintf("Read and execute %v\n", migr.LogString())
+					if err = m.databaseDrv.Run(migr.BufferedBody); err != nil {
+						return err
+					}
+
+				case hasMigTask:
+					err = m.execTask(migr)
+					if err != nil {
+						return fmt.Errorf("migration "+
+							"task execution "+
+							"failed: %w", err)
+					}
+
+				default:
+					// When the migration contains no SQL
+					// migration or migration task, we
+					// continue and set the version to the
+					// migr.TargetVersion.
 				}
 			}
 
@@ -805,6 +861,59 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 			return fmt.Errorf("unknown type: %T with value: %+v", r, r)
 		}
 	}
+	return nil
+}
+
+// execTask checks if a migration task exists for the passed migration and
+// proceeds to execute if one exists. If the migration task fails, the function
+// will reset the database version to the version it was set to before
+// attempting to execute the migration task.
+func (m *Migrate) execTask(migr *Migration) error {
+	m.logVerbosePrintf("Running migration task for %v\n", migr.LogString())
+
+	task, ok := m.opts.tasks[migr.Version]
+	if !ok {
+		return fmt.Errorf("no migration task set for %v",
+			migr.LogString())
+	}
+
+	// Get the current database version before executing the migration task.
+	curVersion, dirty, err := m.databaseDrv.Version()
+	if err != nil {
+		return fmt.Errorf("unable to get current version: %w", err)
+	}
+
+	if dirty {
+		return ErrDirty{curVersion}
+	}
+
+	// Persist that we are at the migration version of the migration task.
+	if err = m.databaseDrv.SetVersion(int(migr.Version), true); err != nil {
+		return err
+	}
+
+	err = task(migr, m.databaseDrv)
+	if err != nil {
+		// Reset the version to the version set before executing the
+		// migration task. Therefore, the migration task will be
+		// re-executed on nnext startup until it succeeds.
+		setErr := m.databaseDrv.SetVersion(curVersion, false)
+		if setErr != nil {
+			// Note that if we error here, the database version will
+			// remain in a dirty state. As we cannot know if the
+			// migration task was executed or not in that scenario,
+			// manual intervention is required.
+			return fmt.Errorf("WARNING, failed to set migration "+
+				"version after migration task errored. Manual "+
+				"intervention needed! Migration task error: "+
+				"%w, version setting error : %w", err, setErr)
+		}
+
+		return fmt.Errorf("failed to execute migration task: %w", err)
+	}
+
+	m.logVerbosePrintf("Migration task finished for %v\n", migr.LogString())
+
 	return nil
 }
 
